@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Space Typing Game - ภารกิจพิมพ์ดีดพิทักษ์อวกาศ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- ลบ Firebase ออกและใช้การเชื่อมต่อกับ Google Apps Script แทน -->
+    <script>
+        // ==========================================
+        // 1. การตั้งค่า Google Sheets (CSV สำหรับคำศัพท์)
+        // ==========================================
+        const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/19qChCxg2QzWRtf_D4z_pjBdHE74t_VbxnwFuEZiGUt8/edit?gid=2033925101#gid=2033925101"; 
+
+        // ==========================================
+        // 2. การตั้งค่า Google Apps Script (Multiplayer Backend)
+        // ==========================================
+        // นำ Web App URL ที่คัดลอกมาจาก Apps Script มาใส่ในเครื่องหมายคำพูดด้านล่างนี้
+        const GAS_URL = "https://script.google.com/macros/s/AKfycbzfmSVtH4xZWFDT1VG9wKUdc5p1A2L3x7p1weEDNX1sHcXC8yhpDCHbW6gPrp96OLBB2Q/exec"; 
+        
+        // สร้าง ID จำลองแบบสุ่มให้ผู้เล่นแต่ละคนเพื่อใช้ระบุตัวตนใน Sheet
+        const userId = Math.random().toString(36).substring(2, 15);
+
+        // ==========================================
+        // ตัวแปรระบบเกม
+        // ==========================================
+        var canvas;
+        var ctx;
+        
+        let gameState = 'START'; 
+        let score = 0;
+        let opponentScore = 0;
+        let activeWords = [];
+        let currentTargetWord = null;
+        let wordSpawnTimer = 0;
+        let wordSpawnInterval = 2000;
+        let fallSpeedMultiplier = 1;
+        let baseSpeedMultiplier = 1; // ตัวคูณความเร็วจากที่ผู้เล่นเลือก
+        let maxHealth = 5; // พลังชีวิตสูงสุด (โดนชนได้ 5 ครั้ง)
+        let currentHealth = 5;
+        let lastTime = 0;
+        let lasers = [];
+        let particles = [];
+        
+        let roomCode = "SOLO";
+        let isHost = false;
+        let pollingInterval = null; // ตัวแปรสำหรับหยุดการดึงข้อมูล
+
+        // คำศัพท์สำรอง
+        let wordsList = ["อวกาศ", "จรวด", "ดวงดาว", "โลก", "จักรวาล", "อุกกาบาต", "มนุษย์ต่างดาว", "กาแล็กซี", "นักบิน", "หลุมดำ", "ดาวเสาร์", "ดาวอังคาร"];
+
+        // ==========================================
+        // ระบบเสียง (Web Audio API)
+        // ==========================================
+        var audioCtx = null;
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function playLaserSound() {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(110, audioCtx.currentTime + 0.1);
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        }
+
+        function playExplosionSound() {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.5);
+        }
+
+        function playErrorSound() {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.2);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.2);
+        }
+
+        // ==========================================
+        // ดึงคำศัพท์
+        // ==========================================
+        async function fetchWords() {
+            if (!SHEET_CSV_URL) return;
+            try {
+                const response = await fetch(SHEET_CSV_URL);
+                const text = await response.text();
+                const rows = text.split('\n');
+                const fetchedWords = rows.map(row => row.trim()).filter(row => row.length > 0);
+                if (fetchedWords.length > 0) wordsList = fetchedWords;
+            } catch (error) {
+                console.error("CSV fetch error", error);
+            }
+        }
+
+        // ==========================================
+        // UI & Modal
+        // ==========================================
+        var uiStart, uiLobby, uiHosting, uiJoining, uiHUD, uiGameOver, modal;
+        
+        function initDOM() {
+            canvas = document.getElementById('gameCanvas');
+            ctx = canvas.getContext('2d');
+            
+            uiStart = document.getElementById('ui-start');
+            uiLobby = document.getElementById('ui-lobby');
+            uiHosting = document.getElementById('ui-hosting');
+            uiJoining = document.getElementById('ui-joining');
+            uiHUD = document.getElementById('ui-hud');
+            uiGameOver = document.getElementById('ui-gameover');
+            modal = document.getElementById('modal');
+            
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas();
+        }
+
+        // รอให้ HTML โหลดเสร็จก่อนค่อยผูกตัวแปรต่างๆ เข้ากับ Canvas และ UI
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initDOM);
+        } else {
+            initDOM();
+        }
+        
+        function hideAllUI() {
+            [uiStart, uiLobby, uiHosting, uiJoining, uiHUD, uiGameOver].forEach(el => el.classList.add('hidden'));
+        }
+        function showModal(title, message) {
+            document.getElementById('modal-title').innerText = title;
+            document.getElementById('modal-message').innerText = message;
+            modal.classList.remove('hidden');
+        }
+        window.closeModal = () => modal.classList.add('hidden');
+
+        function resizeCanvas() {
+            if (!canvas) return;
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+
+        // ==========================================
+        // Google Apps Script Multiplayer Logic
+        // ==========================================
+        async function initAuthAndStart() {
+            initAudio();
+            fetchWords();
+            
+            // ตรวจสอบว่าใส่ลิงก์ Apps Script หรือยัง
+            if (GAS_URL === "") {
+                showModal("แจ้งเตือน", "ยังไม่ได้ใส่ลิงก์ GAS_URL ระบบจะเข้าสู่โหมดเล่นคนเดียวโดยอัตโนมัติ");
+                startSoloGame();
+            } else {
+                hideAllUI();
+                uiLobby.classList.remove('hidden');
+                gameState = 'LOBBY';
+            }
+        }
+        window.initAuthAndStart = initAuthAndStart;
+
+        function startSoloGame() {
+            initAudio();
+            roomCode = "SOLO";
+            startGame();
+        }
+        window.startSoloGame = startSoloGame;
+
+        window.hostGame = async function() {
+            if (!GAS_URL) return showModal("ผิดพลาด", "ไม่พบลิงก์เชื่อมต่อ GAS_URL");
+            isHost = true;
+            hideAllUI();
+            uiHosting.classList.remove('hidden');
+            document.getElementById('host-code').innerText = "กำลังสร้าง...";
+
+            try {
+                // ส่งคำสั่งสร้างห้องไปที่ Apps Script
+                const res = await fetch(GAS_URL, {
+                    method: 'POST',
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: 'createRoom', userId: userId })
+                });
+                const data = await res.json();
+                if(data.success) {
+                    roomCode = data.roomCode;
+                    document.getElementById('host-code').innerText = roomCode;
+                    startPolling(); // เริ่มดึงข้อมูลเช็คว่ามีคนเข้าห้องหรือยัง
+                } else {
+                    showModal("ผิดพลาด", "ไม่สามารถสร้างห้องได้");
+                    cancelHost();
+                }
+            } catch(e) {
+                showModal("ผิดพลาด", "การเชื่อมต่อกับเซิร์ฟเวอร์มีปัญหา");
+                cancelHost();
+            }
+        }
+
+        window.joinGame = async function() {
+            const codeInput = document.getElementById('join-code-input').value;
+            if (codeInput.length !== 4) return showModal("ข้อผิดพลาด", "กรุณากรอกรหัสห้อง 4 หลัก");
+            if (!GAS_URL) return showModal("ผิดพลาด", "ไม่พบลิงก์เชื่อมต่อ GAS_URL");
+
+            isHost = false;
+            try {
+                // ส่งคำสั่งเข้าร่วมห้องไปที่ Apps Script
+                const res = await fetch(GAS_URL, {
+                    method: 'POST',
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: 'joinRoom', roomCode: codeInput, userId: userId })
+                });
+                const data = await res.json();
+                if(data.success) {
+                    roomCode = codeInput;
+                    startGame(); // ผู้เข้าร่วมเข้าเกมทันที
+                } else {
+                    showModal("ข้อผิดพลาด", data.message || "ไม่พบห้อง หรือห้องเต็มแล้ว");
+                }
+            } catch(e) {
+                showModal("ผิดพลาด", "การเชื่อมต่อกับเซิร์ฟเวอร์มีปัญหา");
+            }
+        }
+
+        window.cancelHost = async function() {
+            if(pollingInterval) clearInterval(pollingInterval);
+            
+            // ลบห้องทิ้งหาก Host กดยกเลิก
+            if (isHost && roomCode !== "SOLO") {
+                fetch(GAS_URL, {
+                    method: 'POST',
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: 'deleteRoom', roomCode: roomCode })
+                }).catch(e=>console.log(e)); // Fire and forget
+            }
+            
+            roomCode = "SOLO";
+            hideAllUI();
+            uiLobby.classList.remove('hidden');
+        }
+
+        // ระบบดึงข้อมูลจาก Server ทุกๆ 2 วินาที (Polling)
+        function startPolling() {
+            if(pollingInterval) clearInterval(pollingInterval);
+            
+            pollingInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(GAS_URL, {
+                        method: 'POST',
+                        headers: { "Content-Type": "text/plain;charset=utf-8" },
+                        body: JSON.stringify({ action: 'getRoomStatus', roomCode: roomCode })
+                    });
+                    const data = await res.json();
+                    
+                    if(data.success) {
+                        // 1. ถ้าเป็น Host และมีคนเข้าห้องแล้ว (สถานะเปลี่ยนเป็น playing)
+                        if (gameState === 'HOSTING' && data.status === 'playing') {
+                            startGame();
+                        }
+                        // 2. อัปเดตคะแนนคู่แข่งขณะกำลังเล่นเกม
+                        if (gameState === 'PLAYING') {
+                            opponentScore = isHost ? data.guestScore : data.hostScore;
+                            document.getElementById('hud-opp-score').innerText = opponentScore;
+                        }
+                    }
+                } catch(e) {
+                    // ปล่อยผ่านถ้าเชื่อมต่อหลุดชั่วคราว
+                }
+            }, 2000); 
+        }
+
+        function updateMultiplayerScore(newScore) {
+            if (roomCode === "SOLO" || !GAS_URL) return;
+            // ส่งข้อมูลคะแนนไปหลังบ้านแบบไม่รอผล (Fire and forget เพื่อไม่ให้เกมกระตุก)
+            fetch(GAS_URL, {
+                method: 'POST',
+                headers: { "Content-Type": "text/plain;charset=utf-8" },
+                body: JSON.stringify({ 
+                    action: 'updateScore', 
+                    roomCode: roomCode, 
+                    userId: userId, 
+                    score: newScore, 
+                    isHost: isHost 
+                })
+            }).catch(e=>console.log(e));
+        }
+
+        function updateHealthBar() {
+            const hpPercent = (currentHealth / maxHealth) * 100;
+            const hpFill = document.getElementById('health-fill');
+            if (hpFill) {
+                hpFill.style.width = Math.max(0, hpPercent) + '%';
+                if (hpPercent > 50) {
+                    hpFill.className = "h-full bg-green-500 transition-all duration-300 shadow-[0_0_10px_#22c55e]";
+                } else if (hpPercent > 20) {
+                    hpFill.className = "h-full bg-yellow-500 transition-all duration-300 shadow-[0_0_10px_#eab308]";
+                } else {
+                    hpFill.className = "h-full bg-red-500 transition-all duration-300 shadow-[0_0_10px_#ef4444] animate-pulse";
+                }
+            }
+        }
+
+        // ==========================================
+        // Game Mechanics & Rendering
+        // ==========================================
+        class Word {
+            constructor(text) {
+                this.text = text;
+                this.typed = "";
+                this.x = Math.random() * (canvas.width - 200) + 100;
+                this.y = -50;
+                this.speed = (30 + Math.random() * 20) * fallSpeedMultiplier * baseSpeedMultiplier;
+                this.color = `hsl(${Math.random() * 360}, 80%, 70%)`;
+            }
+            draw(ctx) {
+                ctx.font = "bold 32px 'Sarabun', sans-serif";
+                ctx.textAlign = "center";
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = this.color;
+                
+                ctx.fillStyle = "#39ff14"; 
+                const typedWidth = ctx.measureText(this.typed).width;
+                const fullWidth = ctx.measureText(this.text).width;
+                const startX = this.x - fullWidth / 2;
+                
+                ctx.textAlign = "left";
+                ctx.fillText(this.typed, startX, this.y);
+                
+                ctx.fillStyle = "#ffffff";
+                ctx.fillText(this.text.substring(this.typed.length), startX + typedWidth, this.y);
+                
+                ctx.shadowBlur = 0;
+                ctx.strokeStyle = this.color;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.ellipse(this.x, this.y - 10, fullWidth/2 + 20, 25, 0, 0, Math.PI * 2);
+                ctx.stroke();
+
+                if (currentTargetWord === this) {
+                    ctx.strokeStyle = "#39ff14";
+                    ctx.beginPath();
+                    ctx.moveTo(startX, this.y + 10);
+                    ctx.lineTo(startX + fullWidth, this.y + 10);
+                    ctx.stroke();
+                }
+            }
+            update(dt) { this.y += this.speed * dt; }
+        }
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x; this.y = y;
+                this.vx = (Math.random() - 0.5) * 200;
+                this.vy = (Math.random() - 0.5) * 200;
+                this.life = 1.0; this.color = color;
+            }
+            update(dt) {
+                this.x += this.vx * dt; this.y += this.vy * dt;
+                this.life -= dt * 2;
+            }
+            draw(ctx) {
+                ctx.globalAlpha = Math.max(0, this.life);
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
+        function spawnWord() {
+            const randomWord = wordsList[Math.floor(Math.random() * wordsList.length)];
+            activeWords.push(new Word(randomWord));
+        }
+
+        function createExplosion(x, y, color) {
+            for(let i=0; i<30; i++) particles.push(new Particle(x, y, color));
+            playExplosionSound();
+        }
+
+        function drawSpaceship() {
+            const shipX = canvas.width / 2;
+            const shipY = canvas.height - 50;
+            ctx.save();
+            ctx.translate(shipX, shipY);
+            
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = "#00ffff";
+            ctx.fillStyle = "#00ffff";
+            ctx.beginPath();
+            ctx.moveTo(-10, 10); ctx.lineTo(10, 10); ctx.lineTo(0, 30 + Math.random() * 10);
+            ctx.fill();
+
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = "#ff00ff";
+            ctx.fillStyle = "#1a202c";
+            ctx.strokeStyle = "#ff00ff";
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(0, -30); ctx.lineTo(20, 20); ctx.lineTo(-20, 20);
+            ctx.closePath();
+            ctx.fill(); ctx.stroke();
+            ctx.restore();
+        }
+
+        function startGame() {
+            hideAllUI();
+            uiHUD.classList.remove('hidden');
+            
+            if(roomCode !== "SOLO") {
+                document.getElementById('opponent-score-container').classList.remove('hidden');
+                if(!isHost) startPolling(); // Guest เริ่มเช็คคะแนนตอนเกมเริ่ม
+            } else {
+                document.getElementById('opponent-score-container').classList.add('hidden');
+            }
+
+            // อ่านค่าระดับความเร็วที่ตั้งไว้
+            const speedInput = document.getElementById('speed-select');
+            if (speedInput) baseSpeedMultiplier = parseFloat(speedInput.value);
+
+            gameState = 'PLAYING';
+            score = 0; opponentScore = 0;
+            currentHealth = maxHealth; // รีเซ็ตพลังชีวิต
+            updateHealthBar(); // อัปเดต UI แถบพลังชีวิต
+
+            activeWords = []; particles = []; lasers = [];
+            currentTargetWord = null;
+            fallSpeedMultiplier = 1; wordSpawnInterval = 2500;
+            document.getElementById('hud-score').innerText = score;
+            document.getElementById('hud-opp-score').innerText = opponentScore;
+            
+            lastTime = performance.now();
+            requestAnimationFrame(gameLoop);
+        }
+
+        function gameOver() {
+            gameState = 'GAMEOVER';
+            if(pollingInterval) clearInterval(pollingInterval); // หยุดดึงข้อมูล
+
+            hideAllUI();
+            uiGameOver.classList.remove('hidden');
+            document.getElementById('final-score').innerText = score;
+            
+            let resultText = "เยี่ยมมาก ผู้พิทักษ์อวกาศ!";
+            if (roomCode !== "SOLO") {
+                if (score > opponentScore) resultText = "คุณชนะ! 🎉";
+                else if (score < opponentScore) resultText = "คุณแพ้! พยายามใหม่นะ";
+                else resultText = "เสมอ!";
+                
+                // ลบห้องทิ้งเมื่อเกมจบ (ให้เฉพาะ Host เป็นคนลบเพื่อป้องกันบัค)
+                if(isHost) {
+                    fetch(GAS_URL, {
+                        method: 'POST',
+                        headers: { "Content-Type": "text/plain;charset=utf-8" },
+                        body: JSON.stringify({ action: 'deleteRoom', roomCode: roomCode })
+                    }).catch(e=>console.log(e));
+                }
+            }
+            document.getElementById('game-result-text').innerText = resultText;
+        }
+
+        function gameLoop(timestamp) {
+            if (gameState !== 'PLAYING') return;
+            const dt = (timestamp - lastTime) / 1000;
+            lastTime = timestamp;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            wordSpawnTimer += dt * 1000;
+            if (wordSpawnTimer > wordSpawnInterval) {
+                spawnWord();
+                wordSpawnTimer = 0;
+                fallSpeedMultiplier += 0.02;
+                wordSpawnInterval = Math.max(800, wordSpawnInterval - 20); 
+            }
+
+            for (let i = activeWords.length - 1; i >= 0; i--) {
+                const w = activeWords[i];
+                w.update(dt); w.draw(ctx);
+                if (w.y > canvas.height - 50) {
+                    currentHealth -= 1;
+                    updateHealthBar();
+                    createExplosion(w.x, canvas.height - 50, '#ff0000'); // เอฟเฟกต์โดนโจมตี
+                    playExplosionSound();
+                    
+                    activeWords.splice(i, 1);
+                    if (currentTargetWord === w) currentTargetWord = null;
+
+                    if (currentHealth <= 0) {
+                        gameOver(); return;
+                    }
+                }
+            }
+
+            ctx.strokeStyle = "#39ff14"; ctx.lineWidth = 4;
+            ctx.shadowBlur = 10; ctx.shadowColor = "#39ff14";
+            for (let i = lasers.length - 1; i >= 0; i--) {
+                const l = lasers[i];
+                ctx.beginPath();
+                ctx.moveTo(canvas.width/2, canvas.height - 70);
+                ctx.lineTo(l.targetX, l.targetY);
+                ctx.stroke();
+                l.life -= dt;
+                if(l.life <= 0) lasers.splice(i, 1);
+            }
+            ctx.shadowBlur = 0;
+
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.update(dt); p.draw(ctx);
+                if (p.life <= 0) particles.splice(i, 1);
+            }
+
+            drawSpaceship();
+            requestAnimationFrame(gameLoop);
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (gameState !== 'PLAYING') return;
+            if (e.key.length > 1 && e.key !== 'Backspace') return; 
+
+            const char = e.key;
+
+            if (!currentTargetWord) {
+                let found = null;
+                let sortedWords = [...activeWords].sort((a,b) => b.y - a.y); 
+                for (let w of sortedWords) {
+                    if (w.text.startsWith(char)) { found = w; break; }
+                }
+
+                if (found) {
+                    currentTargetWord = found;
+                    currentTargetWord.typed = char;
+                    playLaserSound();
+                    lasers.push({ targetX: currentTargetWord.x, targetY: currentTargetWord.y, life: 0.1 });
+                } else {
+                    playErrorSound();
+                }
+            } else {
+                const expectedChar = currentTargetWord.text[currentTargetWord.typed.length];
+                if (char === expectedChar) {
+                    currentTargetWord.typed += char;
+                    playLaserSound();
+                    lasers.push({ targetX: currentTargetWord.x, targetY: currentTargetWord.y, life: 0.1 });
+                    
+                    if (currentTargetWord.typed === currentTargetWord.text) {
+                        createExplosion(currentTargetWord.x, currentTargetWord.y, currentTargetWord.color);
+                        score += currentTargetWord.text.length * 10;
+                        document.getElementById('hud-score').innerText = score;
+                        
+                        updateMultiplayerScore(score); // อัปเดตคะแนนไปที่ GAS
+
+                        activeWords = activeWords.filter(w => w !== currentTargetWord);
+                        currentTargetWord = null;
+                    }
+                } else {
+                    playErrorSound();
+                }
+            }
+        });
+    </script>
+    <style>
+        /* ฟอนต์ภาษาไทยอ่านง่ายสำหรับเด็ก */
+        @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;700&display=swap');
+        
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050b14;
+            color: white;
+            font-family: 'Sarabun', sans-serif;
+        }
+
+        /* พื้นหลังดาวระยิบระยับ (CSS Animation ล้วน) */
+        .space-bg {
+            position: absolute;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            z-index: -1;
+            background: radial-gradient(circle at bottom, #111827 0%, #000000 100%);
+        }
+        
+        .stars {
+            width: 1px;
+            height: 1px;
+            background: transparent;
+            box-shadow: 174px 24px #FFF, 842px 93px #FFF, 423px 324px #FFF, 120px 450px #FFF, 934px 520px #FFF, 
+                        234px 720px #FFF, 543px 890px #FFF, 890px 123px #FFF, 230px 420px #FFF, 780px 654px #FFF,
+                        450px 100px #FFF, 320px 800px #FFF, 900px 300px #FFF, 100px 600px #FFF, 600px 700px #FFF;
+            animation: twinkle 5s linear infinite;
+        }
+        .stars2 {
+            width: 2px;
+            height: 2px;
+            background: transparent;
+            box-shadow: 200px 100px #FFF, 500px 300px #FFF, 800px 600px #FFF, 100px 800px #FFF, 900px 900px #FFF,
+                        300px 200px #FFF, 600px 500px #FFF, 700px 150px #FFF, 400px 750px #FFF, 150px 350px #FFF;
+            animation: twinkle 4s linear infinite alternate;
+        }
+
+        @keyframes twinkle {
+            0% { opacity: 0.3; }
+            50% { opacity: 1; }
+            100% { opacity: 0.3; }
+        }
+
+        /* ปุ่มสไตล์นีออนไซไฟ */
+        .btn-neon {
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 12px 24px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            border-radius: 8px;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+            box-shadow: 0 0 10px #00ffff, inset 0 0 10px #00ffff;
+            cursor: pointer;
+        }
+        .btn-neon:hover {
+            background: #00ffff;
+            color: #000;
+            box-shadow: 0 0 20px #00ffff, inset 0 0 20px #00ffff;
+        }
+        
+        .btn-neon-pink {
+            border-color: #ff00ff;
+            color: #ff00ff;
+            box-shadow: 0 0 10px #ff00ff, inset 0 0 10px #ff00ff;
+        }
+        .btn-neon-pink:hover {
+            background: #ff00ff;
+            color: #000;
+            box-shadow: 0 0 20px #ff00ff, inset 0 0 20px #ff00ff;
+        }
+
+        .neon-text {
+            text-shadow: 0 0 10px #00ffff, 0 0 20px #00ffff;
+        }
+        .neon-text-pink {
+            text-shadow: 0 0 10px #ff00ff, 0 0 20px #ff00ff;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- พื้นหลังอวกาศ -->
+    <div class="space-bg">
+        <div class="stars"></div>
+        <div class="stars2"></div>
+    </div>
+
+    <!-- Canvas สำหรับวาดเกม -->
+    <canvas id="gameCanvas" class="absolute top-0 left-0 w-full h-full"></canvas>
+
+    <!-- ================= UI Overlays ================= -->
+    
+    <!-- 1. หน้าจอเริ่มต้น (Start Screen) -->
+    <div id="ui-start" class="absolute inset-0 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm z-10">
+        <h1 class="text-6xl font-bold text-white mb-4 neon-text text-center">SPACE<br>TYPING</h1>
+        <p class="text-xl mb-6 text-cyan-200">ภารกิจพิมพ์ดีด พิทักษ์อวกาศ (ป.5)</p>
+        
+        <!-- เพิ่มตั้งค่าความเร็ว -->
+        <div class="mb-8 flex items-center gap-4 bg-gray-900/90 p-4 rounded-xl border border-cyan-800 shadow-[0_0_15px_rgba(0,255,255,0.2)]">
+            <span class="text-cyan-200 text-lg font-bold">ระดับความเร็ว:</span>
+            <select id="speed-select" class="bg-gray-800 text-white px-4 py-2 rounded-lg border-2 border-cyan-500 focus:outline-none focus:border-pink-500 font-bold cursor-pointer">
+                <option value="0.7">ช้า (มือใหม่)</option>
+                <option value="1.0" selected>ปานกลาง (ป.5)</option>
+                <option value="1.5">เร็ว (ท้าทาย)</option>
+                <option value="2.0">เร็วมาก (ระดับพระกาฬ)</option>
+            </select>
+        </div>
+
+        <button onclick="initAuthAndStart()" class="btn-neon mb-4">เข้าสู่ระบบ / เริ่มเกม</button>
+        <button onclick="startSoloGame()" class="text-gray-400 hover:text-white underline text-sm">เล่นคนเดียว (ไม่เชื่อมต่อเน็ต)</button>
+    </div>
+
+    <!-- 2. หน้าล็อบบี้ (Lobby) -->
+    <div id="ui-lobby" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
+        <h2 class="text-4xl font-bold mb-8 neon-text-pink">เลือกโหมดการเล่น</h2>
+        <div class="flex gap-6">
+            <button onclick="hostGame()" class="btn-neon flex flex-col items-center">
+                <span class="text-2xl mb-2">🏠</span>
+                สร้างห้อง (Host)
+            </button>
+            <button onclick="hideAllUI(); document.getElementById('ui-joining').classList.remove('hidden');" class="btn-neon-pink flex flex-col items-center">
+                <span class="text-2xl mb-2">🚀</span>
+                เข้าร่วมห้อง (Join)
+            </button>
+        </div>
+        <button onclick="startSoloGame()" class="mt-8 text-gray-400 hover:text-white underline">เล่นคนเดียว (Solo)</button>
+    </div>
+
+    <!-- 3. หน้ากำลังสร้างห้อง (Hosting) -->
+    <div id="ui-hosting" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-10">
+        <h2 class="text-3xl font-bold mb-4">รหัสห้องของคุณคือ</h2>
+        <div id="host-code" class="text-6xl font-bold text-yellow-400 tracking-widest mb-8 text-shadow-md">0000</div>
+        <div class="animate-pulse text-cyan-300 mb-8">กำลังรอเพื่อนเข้าร่วม...</div>
+        <button onclick="cancelHost()" class="px-6 py-2 border border-red-500 text-red-500 rounded hover:bg-red-500 hover:text-white transition">ยกเลิก</button>
+    </div>
+
+    <!-- 4. หน้าเข้าร่วมห้อง (Joining) -->
+    <div id="ui-joining" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-10">
+        <h2 class="text-3xl font-bold mb-6 neon-text">กรอกรหัสห้อง 4 หลัก</h2>
+        <input type="number" id="join-code-input" class="bg-gray-800 border-2 border-cyan-500 text-white text-4xl text-center rounded-lg py-3 px-4 w-48 mb-6 focus:outline-none focus:border-pink-500" placeholder="1234" maxlength="4">
+        <div class="flex gap-4">
+            <button onclick="joinGame()" class="btn-neon">เข้าร่วม</button>
+            <button onclick="hideAllUI(); document.getElementById('ui-lobby').classList.remove('hidden');" class="px-6 py-2 border border-gray-500 text-gray-300 rounded hover:bg-gray-700 transition">กลับ</button>
+        </div>
+    </div>
+
+    <!-- 5. หน้าจอขณะเล่น (HUD) -->
+    <div id="ui-hud" class="hidden absolute inset-0 pointer-events-none z-10 flex justify-between p-6">
+        <div class="text-2xl font-bold text-white">
+            <span class="text-cyan-400">คะแนนของคุณ:</span> <span id="hud-score" class="text-3xl text-green-400 text-shadow">0</span>
+        </div>
+        
+        <!-- แถบพลังชีวิต -->
+        <div class="absolute top-6 left-1/2 transform -translate-x-1/2 w-1/3 max-w-md pointer-events-auto text-center">
+            <div class="text-white mb-2 font-bold text-lg text-shadow">พลังชีวิตยาน (HP)</div>
+            <div class="w-full bg-gray-900/80 h-6 rounded-full overflow-hidden border-2 border-gray-400 shadow-[0_0_10px_rgba(0,0,0,0.5)]">
+                <div id="health-fill" class="h-full bg-green-500 transition-all duration-300 w-full shadow-[0_0_10px_#22c55e]"></div>
+            </div>
+        </div>
+
+        <div id="opponent-score-container" class="text-2xl font-bold text-white hidden">
+            <span class="text-pink-400">คะแนนเพื่อน:</span> <span id="hud-opp-score" class="text-3xl text-yellow-400 text-shadow">0</span>
+        </div>
+    </div>
+
+    <!-- 6. หน้าจอจบเกม (Game Over) -->
+    <div id="ui-gameover" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-red-900/80 backdrop-blur-md z-20">
+        <h1 class="text-6xl font-bold text-white mb-2">GAME OVER</h1>
+        <p class="text-xl text-gray-300 mb-8">อุกกาบาตชนยานของคุณแล้ว!</p>
+        
+        <div class="bg-black/50 p-8 rounded-xl border border-red-500 text-center mb-8">
+            <h2 id="game-result-text" class="text-3xl text-yellow-400 font-bold mb-4"></h2>
+            <div class="text-2xl">คะแนนที่ทำได้: <span id="final-score" class="text-4xl text-green-400">0</span></div>
+        </div>
+
+        <div class="flex gap-4">
+            <button onclick="window.location.reload()" class="btn-neon">กลับสู่หน้าหลัก</button>
+        </div>
+    </div>
+
+    <!-- 7. Custom Modal (แทน Alert) -->
+    <div id="modal" class="hidden fixed inset-0 flex items-center justify-center bg-black/60 z-50">
+        <div class="bg-gray-900 border border-cyan-500 p-6 rounded-lg max-w-sm w-full shadow-[0_0_15px_rgba(0,255,255,0.5)]">
+            <h3 id="modal-title" class="text-xl font-bold text-cyan-400 mb-2">แจ้งเตือน</h3>
+            <p id="modal-message" class="text-gray-300 mb-6">ข้อความ</p>
+            <div class="text-right">
+                <button onclick="closeModal()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded font-bold">ตกลง</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
